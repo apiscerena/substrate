@@ -173,7 +173,7 @@ where
 
 	fn execute<E: Ext<T = T>>(
 		self,
-		mut ext: E,
+		ext: &mut E,
 		function: &ExportedFunction,
 		input_data: Vec<u8>,
 		gas_meter: &mut GasMeter<E::T>,
@@ -197,7 +197,7 @@ where
 		});
 
 		let mut runtime = Runtime::new(
-			&mut ext,
+			ext,
 			input_data,
 			memory,
 			gas_meter,

@@ -324,7 +324,7 @@ pub trait Executable<T: Config>: Sized {
 	/// all of its emitted storage changes.
 	fn execute<E: Ext<T = T>>(
 		self,
-		ext: E,
+		ext: &mut E,
 		function: &ExportedFunction,
 		input_data: Vec<u8>,
 		gas_meter: &mut GasMeter<T>,
@@ -361,10 +361,7 @@ pub trait Executable<T: Config>: Sized {
 }
 
 pub struct ExecutionContext<'a, T: Config + 'a, E> {
-	caller: Option<&'a ExecutionContext<'a, T, E>>,
-	self_account: T::AccountId,
-	self_trie_id: Option<TrieId>,
-	depth: usize,
+	origin: T::AccountId,
 	schedule: &'a Schedule<T>,
 	timestamp: MomentOf<T>,
 	block_number: T::BlockNumber,
@@ -381,30 +378,12 @@ where
 	///
 	/// The specified `origin` address will be used as `sender` for. The `origin` must be a regular
 	/// account (not a contract).
-	pub fn top_level(origin: T::AccountId, schedule: &'a Schedule<T>) -> Self {
+	pub fn new(origin: T::AccountId, schedule: &'a Schedule<T>) -> Self {
 		ExecutionContext {
-			caller: None,
-			self_trie_id: None,
-			self_account: origin,
-			depth: 0,
+			origin,
 			schedule,
 			timestamp: T::Time::now(),
 			block_number: <frame_system::Pallet<T>>::block_number(),
-			_phantom: Default::default(),
-		}
-	}
-
-	fn nested<'b, 'c: 'b>(&'c self, dest: T::AccountId, trie_id: TrieId)
-		-> ExecutionContext<'b, T, E>
-	{
-		ExecutionContext {
-			caller: Some(self),
-			self_trie_id: Some(trie_id),
-			self_account: dest,
-			depth: self.depth + 1,
-			schedule: self.schedule,
-			timestamp: self.timestamp.clone(),
-			block_number: self.block_number.clone(),
 			_phantom: Default::default(),
 		}
 	}
@@ -414,14 +393,15 @@ where
 	/// # Return Value
 	///
 	/// Result<(ExecReturnValue, CodeSize), (ExecError, CodeSize)>
-	pub fn call(
+	pub fn call<'b>(
 		&mut self,
+		frame: Option<&CallContext<'a, 'b, T, E>>,
 		dest: T::AccountId,
 		value: BalanceOf<T>,
 		gas_meter: &mut GasMeter<T>,
 		input_data: Vec<u8>,
 	) -> Result<(ExecReturnValue, u32), (ExecError, u32)> {
-		if self.depth == T::MaxDepth::get() as usize {
+		if frame.map(|f| f.depth).unwrap_or(0) == T::MaxDepth::get() as usize {
 			return Err((Error::<T>::MaxCallDepthReached.into(), 0));
 		}
 
@@ -442,26 +422,24 @@ where
 			.map_err(|e| (e.into(), code_len))?
 			.ok_or((Error::<T>::NotCallable.into(), code_len))?;
 
-		let transactor_kind = self.transactor_kind();
-		let caller = self.self_account.clone();
+		let next_frame = if let Some(parent) = frame {
+			parent.nested(dest, value, &contract, &executable)
+		} else {
+			CallContext::root(self, dest, value, &contract, &executable)
+		};
 
-		let result = self.with_nested_context(dest.clone(), contract.trie_id.clone(), |nested| {
+		let result = CallContext::with_context(next_frame, |frame| {
 			if value > BalanceOf::<T>::zero() {
 				transfer::<T>(
-					TransferCause::Call,
-					transactor_kind,
-					&caller,
-					&dest,
+					frame.call_instantiate_transfer_type(),
+					frame.caller(),
+					&frame.account,
 					value,
 				)?
 			}
 
-			let call_context = nested.new_call_context(
-				caller, &dest, value, &contract, &executable,
-			);
-
 			let output = executable.execute(
-				call_context,
+				frame,
 				&ExportedFunction::Call,
 				input_data,
 				gas_meter,
@@ -471,43 +449,53 @@ where
 		Ok((result, code_len))
 	}
 
-	pub fn instantiate(
+	pub fn instantiate<'b>(
 		&mut self,
+		frame: Option<&CallContext<'a, 'b, T, E>>,
 		endowment: BalanceOf<T>,
 		gas_meter: &mut GasMeter<T>,
 		executable: E,
 		input_data: Vec<u8>,
 		salt: &[u8],
 	) -> Result<(T::AccountId, ExecReturnValue), ExecError> {
-		if self.depth == T::MaxDepth::get() as usize {
+		if frame.map(|p| p.depth).unwrap_or(0) == T::MaxDepth::get() as usize {
 			Err(Error::<T>::MaxCallDepthReached)?
 		}
 
-		let transactor_kind = self.transactor_kind();
-		let caller = self.self_account.clone();
-		let dest = Contracts::<T>::contract_address(&caller, executable.code_hash(), salt);
+		let dest = Contracts::<T>::contract_address(
+			frame.map(|f| &f.account).unwrap_or(&self.origin),
+			executable.code_hash(),
+			salt,
+		);
 
 		let output = frame_support::storage::with_transaction(|| {
+			use frame_support::storage::TransactionOutcome::*;
+
 			// Generate the trie id in a new transaction to only increment the counter on success.
 			let dest_trie_id = Storage::<T>::generate_trie_id(&dest);
 
-			let output = self.with_nested_context(dest.clone(), dest_trie_id, |nested| {
-				let contract = Storage::<T>::place_contract(
-					&dest,
-					nested
-						.self_trie_id
-						.clone()
-						.expect("the nested context always has to have self_trie_id"),
-					executable.code_hash().clone()
-				)?;
+			let contract = match Storage::<T>::place_contract(
+				&dest,
+				dest_trie_id,
+				executable.code_hash().clone(),
+			) {
+				Ok(val) => val,
+				Err(err) => return Rollback(Err(err.into())),
+			};
 
+			let next_frame = if let Some(parent) = frame {
+				parent.nested(dest, endowment, &contract, &executable)
+			} else {
+				CallContext::root(self, dest, endowment, &contract, &executable)
+			};
+
+			let output = CallContext::with_context(next_frame, |frame| {
 				// Send funds unconditionally here. If the `endowment` is below existential_deposit
 				// then error will be returned here.
 				transfer::<T>(
-					TransferCause::Instantiate,
-					transactor_kind,
-					&caller,
-					&dest,
+					frame.call_instantiate_transfer_type(),
+					frame.caller(),
+					&frame.account,
 					endowment,
 				)?;
 
@@ -517,16 +505,8 @@ where
 				// spawned. This is OK as overcharging is always safe.
 				let occupied_storage = executable.occupied_storage();
 
-				let call_context = nested.new_call_context(
-					caller.clone(),
-					&dest,
-					endowment,
-					&contract,
-					&executable,
-				);
-
 				let output = executable.execute(
-					call_context,
+					frame,
 					&ExportedFunction::Constructor,
 					input_data,
 					gas_meter,
@@ -534,7 +514,7 @@ where
 
 				// We need to re-fetch the contract because changes are written to storage
 				// eagerly during execution.
-				let contract = <ContractInfoOf<T>>::get(&dest)
+				let contract = <ContractInfoOf<T>>::get(&frame.account)
 					.and_then(|contract| contract.get_alive())
 					.ok_or(Error::<T>::NotCallable)?;
 
@@ -547,12 +527,13 @@ where
 					.ok_or(Error::<T>::NewContractNotFunded)?;
 
 				// Deposit an instantiation event.
-				deposit_event::<T>(vec![], Event::Instantiated(caller.clone(), dest.clone()));
+				deposit_event::<T>(vec![], Event::Instantiated(
+					frame.caller().clone(), frame.account.clone(),
+				));
 
 				Ok(output)
 			});
 
-			use frame_support::storage::TransactionOutcome::*;
 			match output {
 				Ok(_) => Commit(output),
 				Err(_) => Rollback(output),
@@ -561,77 +542,17 @@ where
 
 		Ok((dest, output))
 	}
-
-	fn new_call_context<'b>(
-		&'b mut self,
-		caller: T::AccountId,
-		dest: &T::AccountId,
-		value: BalanceOf<T>,
-		contract: &AliveContractInfo<T>,
-		executable: &E,
-	) -> CallContext<'b, 'a, T, E> {
-		let timestamp = self.timestamp.clone();
-		let block_number = self.block_number.clone();
-		CallContext {
-			ctx: self,
-			caller,
-			value_transferred: value,
-			timestamp,
-			block_number,
-			rent_params: RentParams::new(dest, contract, executable),
-			_phantom: Default::default(),
-		}
-	}
-
-	/// Execute the given closure within a nested execution context.
-	fn with_nested_context<F>(&mut self, dest: T::AccountId, trie_id: TrieId, func: F)
-		-> ExecResult
-		where F: FnOnce(&mut ExecutionContext<T, E>) -> ExecResult
-	{
-		use frame_support::storage::TransactionOutcome::*;
-		let mut nested = self.nested(dest, trie_id);
-		frame_support::storage::with_transaction(|| {
-			let output = func(&mut nested);
-			match output {
-				Ok(ref rv) if !rv.flags.contains(ReturnFlags::REVERT) => Commit(output),
-				_ => Rollback(output),
-			}
-		})
-	}
-
-	/// Returns whether a contract, identified by address, is currently live in the execution
-	/// stack, meaning it is in the middle of an execution.
-	fn is_live(&self, account: &T::AccountId) -> bool {
-		&self.self_account == account ||
-			self.caller.map_or(false, |caller| caller.is_live(account))
-	}
-
-	fn transactor_kind(&self) -> TransactorKind {
-		if self.depth == 0 {
-			debug_assert!(self.self_trie_id.is_none());
-			debug_assert!(self.caller.is_none());
-			debug_assert!(ContractInfoOf::<T>::get(&self.self_account).is_none());
-			TransactorKind::PlainAccount
-		} else {
-			TransactorKind::Contract
-		}
-	}
 }
 
 /// Describes whether we deal with a contract or a plain account.
-enum TransactorKind {
-	/// Transaction was initiated from a plain account. That can be either be through a
+enum TransferType {
+	/// Transfer was initiated from a plain account. That can be either be through a
 	/// signed transaction or through RPC.
-	PlainAccount,
-	/// The call was initiated by a contract account.
-	Contract,
-}
-
-/// Describes possible transfer causes.
-enum TransferCause {
-	Call,
-	Instantiate,
-	Terminate,
+	PlainAccountTransfer,
+	/// Transfer was initiated by a contract.
+	ContractTransfer,
+	/// A contract requested self termination through `seal_terminate`.
+	Termination,
 }
 
 /// Transfer some funds from `transactor` to `dest`.
@@ -641,8 +562,7 @@ enum TransferCause {
 /// subsistence threshold (for contracts) or the existential deposit (for plain accounts)
 /// results in an error.
 fn transfer<T: Config>(
-	cause: TransferCause,
-	origin: TransactorKind,
+	transfer_type: TransferType,
 	transactor: &T::AccountId,
 	dest: &T::AccountId,
 	value: BalanceOf<T>,
@@ -650,14 +570,13 @@ fn transfer<T: Config>(
 where
 	T::AccountId: UncheckedFrom<T::Hash> + AsRef<[u8]>,
 {
-	use self::TransferCause::*;
-	use self::TransactorKind::*;
+	use self::TransferType::*;
 
 	// Only seal_terminate is allowed to bring the sender below the subsistence
 	// threshold or even existential deposit.
-	let existence_requirement = match (cause, origin) {
-		(Terminate, _) => ExistenceRequirement::AllowDeath,
-		(_, Contract) => {
+	let existence_requirement = match transfer_type {
+		PlainAccountTransfer => ExistenceRequirement::KeepAlive,
+		ContractTransfer => {
 			ensure!(
 				T::Currency::total_balance(transactor).saturating_sub(value) >=
 					Contracts::<T>::subsistence_threshold(),
@@ -665,7 +584,7 @@ where
 			);
 			ExistenceRequirement::KeepAlive
 		},
-		(_, PlainAccount) => ExistenceRequirement::KeepAlive,
+		Termination => ExistenceRequirement::AllowDeath,
 	};
 
 	T::Currency::transfer(transactor, dest, value, existence_requirement)
@@ -686,13 +605,93 @@ where
 /// on the path of the return from that call context. Therefore, care must be taken in these
 /// situations.
 struct CallContext<'a, 'b: 'a, T: Config + 'b, E> {
+	depth: usize,
 	ctx: &'a mut ExecutionContext<'b, T, E>,
-	caller: T::AccountId,
+	parent: Option<&'a CallContext<'a, 'b, T, E>>,
+	account: T::AccountId,
+	trie_id: TrieId,
 	value_transferred: BalanceOf<T>,
-	timestamp: MomentOf<T>,
-	block_number: T::BlockNumber,
 	rent_params: RentParams<T>,
 	_phantom: PhantomData<E>,
+}
+
+impl<'a, 'b: 'a, T, E> CallContext<'a, 'b, T, E>
+where
+	T: Config + 'b,
+	T::AccountId: UncheckedFrom<T::Hash> + AsRef<[u8]>,
+	E: Executable<T>,
+{
+	fn root(
+		ctx: &'a mut ExecutionContext<'b, T, E>,
+		dest: T::AccountId,
+		value_transferred: BalanceOf<T>,
+		contract: &AliveContractInfo<T>,
+		executable: &E,
+	) -> CallContext<'a, 'b, T, E> {
+		CallContext {
+			// TODO: move the depth check here?
+			depth: 1,
+			ctx,
+			parent: None,
+			rent_params: RentParams::new(&dest, contract, executable),
+			account: dest,
+			trie_id: contract.trie_id,
+			value_transferred,
+			_phantom: Default::default(),
+		}
+	}
+
+	fn nested(
+		&'a self,
+		dest: T::AccountId,
+		value_transferred: BalanceOf<T>,
+		contract: &AliveContractInfo<T>,
+		executable: &E,
+	) -> CallContext<'a, 'b, T, E> {
+		CallContext {
+			depth: self.depth + 1,
+			ctx: self.ctx,
+			parent: Some(self),
+			rent_params: RentParams::new(&dest, contract, executable),
+			account: dest,
+			trie_id: contract.trie_id,
+			value_transferred,
+			_phantom: Default::default(),
+		}
+	}
+
+	/// Execute the given closure within a nested execution context.
+	fn with_context<F>(ctx: Self, func: F) -> ExecResult
+	where
+		F: FnOnce(&mut Self) -> ExecResult,
+	{
+		use frame_support::storage::TransactionOutcome::*;
+		frame_support::storage::with_transaction(|| {
+			let output = func(&mut ctx);
+			match output {
+				Ok(ref rv) if !rv.flags.contains(ReturnFlags::REVERT) => Commit(output),
+				_ => Rollback(output),
+			}
+		})
+	}
+
+	/// Returns whether the current contract is already somewhere on the call stack.
+	fn is_live(&self) -> bool {
+		while let Some(parent) = self.parent {
+			if parent.account == self.account {
+				return true;
+			}
+		}
+		false
+	}
+
+	fn call_instantiate_transfer_type(&self) -> TransferType {
+		if self.parent.is_none() {
+			TransferType::PlainAccountTransfer
+		} else {
+			TransferType::ContractTransfer
+		}
+	}
 }
 
 impl<'a, 'b: 'a, T, E> Ext for CallContext<'a, 'b, T, E>
@@ -703,29 +702,14 @@ where
 {
 	type T = T;
 
-	fn get_storage(&self, key: &StorageKey) -> Option<Vec<u8>> {
-		let trie_id = self.ctx.self_trie_id.as_ref().expect(
-			"`ctx.self_trie_id` points to an alive contract within the `CallContext`;\
-				it cannot be `None`;\
-				expect can't fail;\
-				qed",
-		);
-		Storage::<T>::read(trie_id, key)
-	}
-
-	fn set_storage(&mut self, key: StorageKey, value: Option<Vec<u8>>) -> DispatchResult {
-		let trie_id = self.ctx.self_trie_id.as_ref().expect(
-			"`ctx.self_trie_id` points to an alive contract within the `CallContext`;\
-				it cannot be `None`;\
-				expect can't fail;\
-				qed",
-		);
-		// write panics if the passed account is not alive.
-		// the contract must be in the alive state within the `CallContext`;\
-		// the contract cannot be absent in storage;
-		// write cannot return `None`;
-		// qed
-		Storage::<T>::write(&self.ctx.self_account, trie_id, &key, value)
+	fn call(
+		&mut self,
+		dest: &T::AccountId,
+		value: BalanceOf<T>,
+		gas_meter: &mut GasMeter<T>,
+		input_data: Vec<u8>,
+	) -> Result<(ExecReturnValue, u32), (ExecError, u32)> {
+		self.ctx.call(Some(self), dest.clone(), value, gas_meter, input_data)
 	}
 
 	fn instantiate(
@@ -739,7 +723,7 @@ where
 		let executable = E::from_storage(code_hash, &self.ctx.schedule, gas_meter)
 			.map_err(|e| (e.into(), 0))?;
 		let code_len = executable.code_len();
-		self.ctx.instantiate(endowment, gas_meter, executable, input_data, salt)
+		self.ctx.instantiate(Some(self), endowment, gas_meter, executable, input_data, salt)
 			.map(|r| (r.0, r.1, code_len))
 			.map_err(|e| (e, code_len))
 	}
@@ -750,9 +734,8 @@ where
 		value: BalanceOf<T>,
 	) -> DispatchResult {
 		transfer::<T>(
-			TransferCause::Call,
-			TransactorKind::Contract,
-			&self.ctx.self_account.clone(),
+			TransferType::ContractTransfer,
+			&self.account,
 			to,
 			value,
 		)
@@ -762,24 +745,20 @@ where
 		&mut self,
 		beneficiary: &AccountIdOf<Self::T>,
 	) -> Result<u32, (DispatchError, u32)> {
-		let self_id = self.ctx.self_account.clone();
-		let value = T::Currency::free_balance(&self_id);
-		if let Some(caller_ctx) = self.ctx.caller {
-			if caller_ctx.is_live(&self_id) {
-				return Err((Error::<T>::ReentranceDenied.into(), 0));
-			}
+		let value = T::Currency::free_balance(&self.account);
+		if self.is_live() {
+			return Err((Error::<T>::ReentranceDenied.into(), 0));
 		}
 		transfer::<T>(
-			TransferCause::Terminate,
-			TransactorKind::Contract,
-			&self_id,
+			TransferType::Termination,
+			&self.account,
 			beneficiary,
 			value,
 		).map_err(|e| (e, 0))?;
-		if let Some(ContractInfo::Alive(info)) = ContractInfoOf::<T>::take(&self_id) {
+		if let Some(ContractInfo::Alive(info)) = ContractInfoOf::<T>::take(&self.account) {
 			Storage::<T>::queue_trie_for_deletion(&info).map_err(|e| (e, 0))?;
 			let code_len = E::remove_user(info.code_hash);
-			Contracts::<T>::deposit_event(Event::Terminated(self_id, beneficiary.clone()));
+			Contracts::<T>::deposit_event(Event::Terminated(self.account, beneficiary.clone()));
 			Ok(code_len)
 		} else {
 			panic!(
@@ -790,14 +769,12 @@ where
 		}
 	}
 
-	fn call(
-		&mut self,
-		to: &T::AccountId,
-		value: BalanceOf<T>,
-		gas_meter: &mut GasMeter<T>,
-		input_data: Vec<u8>,
-	) -> Result<(ExecReturnValue, u32), (ExecError, u32)> {
-		self.ctx.call(to.clone(), value, gas_meter, input_data)
+	fn get_storage(&self, key: &StorageKey) -> Option<Vec<u8>> {
+		Storage::<T>::read(&self.trie_id, key)
+	}
+
+	fn set_storage(&mut self, key: StorageKey, value: Option<Vec<u8>>) -> DispatchResult {
+		Storage::<T>::write(&self.account, &self.trie_id, &key, value)
 	}
 
 	fn restore_to(
@@ -807,14 +784,12 @@ where
 		rent_allowance: BalanceOf<Self::T>,
 		delta: Vec<StorageKey>,
 	) -> Result<(u32, u32), (DispatchError, u32, u32)> {
-		if let Some(caller_ctx) = self.ctx.caller {
-			if caller_ctx.is_live(&self.ctx.self_account) {
-				return Err((Error::<T>::ReentranceDenied.into(), 0, 0));
-			}
+		if self.is_live() {
+			return Err((Error::<T>::ReentranceDenied.into(), 0, 0));
 		}
 
 		let result = Rent::<T, E>::restore_to(
-			self.ctx.self_account.clone(),
+			self.account.clone(),
 			dest.clone(),
 			code_hash.clone(),
 			rent_allowance,
@@ -824,7 +799,7 @@ where
 			deposit_event::<Self::T>(
 				vec![],
 				Event::Restored(
-					self.ctx.self_account.clone(),
+					self.account.clone(),
 					dest,
 					code_hash,
 					rent_allowance,
@@ -835,15 +810,15 @@ where
 	}
 
 	fn address(&self) -> &T::AccountId {
-		&self.ctx.self_account
+		&self.account
 	}
 
 	fn caller(&self) -> &T::AccountId {
-		&self.caller
+		&self.caller()
 	}
 
 	fn balance(&self) -> BalanceOf<T> {
-		T::Currency::free_balance(&self.ctx.self_account)
+		T::Currency::free_balance(&self.account)
 	}
 
 	fn value_transferred(&self) -> BalanceOf<T> {
@@ -855,7 +830,7 @@ where
 	}
 
 	fn now(&self) -> &MomentOf<T> {
-		&self.timestamp
+		&self.ctx.timestamp
 	}
 
 	fn minimum_balance(&self) -> BalanceOf<T> {
@@ -869,13 +844,13 @@ where
 	fn deposit_event(&mut self, topics: Vec<T::Hash>, data: Vec<u8>) {
 		deposit_event::<Self::T>(
 			topics,
-			Event::ContractEmitted(self.ctx.self_account.clone(), data)
+			Event::ContractEmitted(self.account.clone(), data)
 		);
 	}
 
 	fn set_rent_allowance(&mut self, rent_allowance: BalanceOf<T>) {
 		if let Err(storage::ContractAbsentError) =
-			Storage::<T>::set_rent_allowance(&self.ctx.self_account, rent_allowance)
+			Storage::<T>::set_rent_allowance(&self.account, rent_allowance)
 		{
 			panic!(
 				"`self_account` points to an alive contract within the `CallContext`;
@@ -885,11 +860,11 @@ where
 	}
 
 	fn rent_allowance(&self) -> BalanceOf<T> {
-		Storage::<T>::rent_allowance(&self.ctx.self_account)
+		Storage::<T>::rent_allowance(&self.account)
 			.unwrap_or_else(|_| <BalanceOf<T>>::max_value()) // Must never be triggered actually
 	}
 
-	fn block_number(&self) -> T::BlockNumber { self.block_number }
+	fn block_number(&self) -> T::BlockNumber { self.ctx.block_number }
 
 	fn max_value_size(&self) -> u32 {
 		T::MaxValueSize::get()
@@ -1086,7 +1061,7 @@ mod tests {
 
 		fn execute<E: Ext<T = Test>>(
 			self,
-			mut ext: E,
+			&mut ext: E,
 			function: &ExportedFunction,
 			input_data: Vec<u8>,
 			gas_meter: &mut GasMeter<Test>,
@@ -1096,7 +1071,7 @@ mod tests {
 			}
 			if function == &self.func_type {
 				(self.func)(MockCtx {
-					ext: &mut ext,
+					ext: ext,
 					input_data,
 					gas_meter,
 				}, &self)
